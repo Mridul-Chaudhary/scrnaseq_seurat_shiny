@@ -1,0 +1,391 @@
+---
+title: "Single Cell RNA-seq Downstream Analysis"
+output: 
+        html_document:
+          toc: true
+          theme: united
+          number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+## Introduction
+
+This notebook demonstrates downstream analysis of single cell RNA-seq data using Seurat and various annotation tools. Each step is documented and explained for reproducibility.\
+**Note:** To keep the workflow clean, package installation should be done separately before running this notebook (see `install_packages.R`).
+
+## Problem Statement
+
+#scRNA-seq Analysis Task\
+\# Using the problem statement here as a checklist
+
+You are provided with a single-cell RNA-seq dataset (UMI-based) obtained from human brain tissue, collected across multiple patients with known age and sex. The expression matrix contains biological heterogeneity (e.g., different cell types) and possible confounders. Your goal is to identify and annotate major cell types within the dataset.
+
+1.  Process raw data (count matrix) —\> Check\
+    Assess quality control (both cell- and gene-level) —\> Check\
+    normalize and visualize the dataset using your preferred algorithm (e.g., PCA, UMAP, etc.) —\> Check\
+    (Optional) Explore and comment on any evidence of batch effects within the dataset. —\> Check
+2.  Clustering & Cell Type Annotation Identify clusters using a method of your choice (e.g., leiden or louvain) —\> Check\
+    and annotate clusters into known broad cell types found in the brain (e.g., excitatory neurons, interneurons, astrocytes, microglia, oligodendrocytes). —\> Check\
+    Briefly mention how you annotated the clusters (for instance, you could include a heatmap of top markers per cluster, marker genes, or a table mapping clusters to putative cell types). —\> Check\
+    (Optional) Explore and comment on any evidence of regionality within the dataset. —\> **Not achieved**. \
+    Would love to apply computational methods for spatial reconstruction without actual spatial data. This method requires fastq files
+3.  Deliverables\
+    Send us either an RMarkdown or Jupyter notebook file with: Code and plots for preprocessing, clustering, annotation, and other downstream analysis (if applicable). —\> Check\
+    Brief decision-making for the steps undertaken. —\> Check (Small comments mentioned for each tool)
+4.  Optional: Include a short paragraph summarizing your findings and your biological interpretations. —\> Check
+
+## Load Required Packages
+
+```{r load-libraries}
+# Load all required libraries.
+suppressPackageStartupMessages({
+library(Seurat)        # Main single cell RNA-seq workflow
+library(ggplot2)       # Visualization
+library(SeuratData)    # Datasets for Seurat
+library(Azimuth)       # Reference mapping for cell annotation
+library(patchwork)     # Combine ggplot2-based plots
+library(presto)        # Fast marker detection
+library(SingleR)       # Automated cell annotation
+library(celldex)       # Reference datasets for SingleR
+library(scCATCH)       # Another annotation tool
+library(openai)        # GPT-based annotation (if using OpenAI)
+library(GPTCelltype)   # GPT-based annotation
+library(scRNAseq)      # Example/reference datasets
+library(knitr)         # to use kable function to display dataframes
+library(kableExtra)    # Improve table outputs in html
+library(dplyr)         # data manipulation
+})
+
+```
+
+## Set Working Directory
+
+```{r set-wd}
+# Set your working directory if you are not running this from the project root.
+setwd("/oscache/scp/kptl632/ki")
+```
+
+## Data Import
+
+```{r data-import}
+# Read in the count matrix, barcodes, and gene list.
+ki_data <- ReadMtx(
+  mtx = "data/counts.mtx",
+  cells = "data/barcodes.txt",
+  features = "data/genes.txt",
+  feature.column = 1
+)
+# Create Seurat object from the matrix
+ki <- CreateSeuratObject(counts = ki_data, project = "ki_brain", min.cells = 3, min.features = 200)
+```
+
+## Quality Control
+
+```{r qc}
+# Calculate the percentage of mitochondrial genes for each cell
+ki[["percent.mt"]] <- PercentageFeatureSet(ki, pattern = "^MT-")
+
+# Visualize QC metrics
+VlnPlot(ki, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# Feature scatter plots: useful for visualizing relationships between metrics
+FeatureScatter(ki, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+## Normalization and Feature Selection
+
+```{r normalization}
+# Normalize the raw count data
+ki <- NormalizeData(ki, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# Identify the most variable features
+ki <- FindVariableFeatures(ki, selection.method = "vst", nfeatures = 2000)
+
+# Identify top 10 variable features for labeling
+top10 <- head(VariableFeatures(ki), 10)
+```
+
+## Visualization of Variable Features
+
+```{r variable-features}
+# Plot variable features across the dataset
+plot1 <- VariableFeaturePlot(ki)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot2
+```
+
+## Scaling and PCA
+
+```{r scaling-pca}
+# Scale the data (z-score transformation)
+
+all.genes <- rownames(ki)
+ki <- ScaleData(ki, features = all.genes)
+
+# Run PCA for dimensionality reduction
+ki <- RunPCA(ki, features = VariableFeatures(object = ki))
+
+# Examine top principal components
+
+#print(ki[["pca"]], dims = 1:5, nfeatures = 5)
+
+VizDimLoadings(ki, dims = 1:2, reduction = "pca")
+DimPlot(ki, reduction = "pca") + NoLegend()
+DimHeatmap(ki, dims = 1:15, cells = 500, balanced = TRUE)
+
+# Determine the number of PCs to use for downstream steps
+ElbowPlot(ki)
+```
+
+## Clustering
+
+```{r clustering}
+# Find cell neighbors and clusters (using the first 10 PCs as an example)
+ki <- FindNeighbors(ki, dims = 1:10)
+ki <- FindClusters(ki, resolution = 0.5)
+```
+
+## UMAP Dimensionality Reduction
+
+```{r umap}
+# Run UMAP for visualization in 2D space
+ki <- RunUMAP(ki, dims = 1:10)
+DimPlot(ki, reduction = "umap", label = TRUE)
+```
+
+## Marker Discovery
+
+```{r markers}
+# Find marker genes for each cluster using Seurat's FindMarkers
+# Find all positive markers for all clusters
+ki_markers_pos <- FindAllMarkers(ki, only.pos = TRUE)
+
+ki_markers_pos %>% group_by(cluster) %>% dplyr::filter(avg_log2FC > 2 & pct.1 > 0.8) %>% kable(format="markdown",align='c') %>% kable_styling("striped", full_width = T) %>%  scroll_box(height = "200px")
+```
+
+## Cell Type Annotation: SingleR
+
+```{r singler-annotation}
+# Automated cell type annotation using SingleR and HumanPrimaryCellAtlas reference
+hpca.se <- celldex::HumanPrimaryCellAtlasData()
+pred.ki <- SingleR(test = as.SingleCellExperiment(ki), ref = hpca.se, assay.type.test = 1, labels = hpca.se$label.main)
+ki[["SingleR.labels"]] <- pred.ki$labels
+DimPlot(ki, group.by = "SingleR.labels", label = TRUE, repel = T) + NoLegend()
+```
+
+## Cell Type Annotation: scCATCH
+
+```{r sccatch-annotation}
+# Run scCATCH for another cell type annotation approach
+xyz=ki@assays$RNA@layers$scale.data
+dim(xyz)
+colnames(xyz)=rownames(ki@assays$RNA@cells@.Data)
+rownames(xyz)=rownames(ki@assays$RNA@features@.Data)
+
+catch1 <- createscCATCH(data = xyz, cluster = as.character(Idents(ki)))
+catch1 <- findmarkergene(catch1,species = "Human",tissue = "Brain",marker = cellmatch )
+catch1 <- findcelltype(catch1)
+
+# The label names were quite long and unreadable. Below is a manual effort for simpler representation of celltypes produced by scCatch.
+catch_ids=c("Astrocyte or Neuron", "Astrocyte1", "2", "Oligodendrocyte1", "4", "Astrocyte2", "Oligodendrocyte2", "7", "Oligodendrocyte3", "Neuron1", "Neuron2", "Endothelial", "Microglial")
+names(catch_ids) <- levels(ki)
+catch_label=data.frame("seurat"= ki$seurat_clusters,"catch"=catch_ids[ki$seurat_clusters])
+ki[["scCatch.celltype"]] <- catch_label$catch
+DimPlot(ki, group.by ="scCatch.celltype" , label = TRUE, pt.size = 0.5)
+```
+
+## Cell Type Annotation: Azimuth
+
+```{r azimuth-annotation}
+# Reference mapping with Azimuth (requires a downloaded reference)
+# Example: path = "azimuth/human_cortex/"
+#reference <- LoadReference(path = "azimuth/human_cortex/")
+ki <- RunAzimuth(ki, reference = "humancortexref")
+DimPlot(ki, group.by = "predicted.subclass", label = TRUE, label.size = 3,repel = T) + NoLegend()
+DimPlot(ki, group.by = "predicted.class", label = TRUE, label.size = 3,repel = T) + NoLegend()
+
+```
+
+## Cell Type Annotation: GPTCelltype
+
+This step can be automated using ChatGPT API but it was chargable. I have used the same prompt but in the UI.
+
+Prompt used with top 10 genes of each cluster:
+
+"Identify cell types of cells using the following markers separately for each row. Only provide the cell type name. Do not show numbers before the name. Some can be a mixture of multiple cell types"\
+\
+NXPH1,SOX6,RP11-123O10.4,SPOCK3,GAD1,KIAA1217,GRIK1,ZNF385D,TAC1,LHX6
+
+```{r gpt-annotation}
+# GPT-based annotation (make sure your OpenAI API key is set)
+# Example cell type labels for clusters
+
+input=ki_markers_pos
+input <- input[input$avg_log2FC > 0,,drop=FALSE]
+input <- tapply(input$gene,list(input$cluster),function(i) paste0(i[1:10],collapse=','))
+
+#Next step here is an API call to ChatGPT with a prompt to predict celltype with top 10 genes 
+# GPTCelltype package has automated this process but I used the same prompt manually in ChatGPT. 
+#API usage requires balance in openAI credits. May be less than $1 would have sufficed.
+
+gpt_markers=c("GABAergic interneurons (SST+, PVALB+ subtypes)",
+              "Astrocytes",
+              "Excitatory neurons",
+              "Neurons1",
+              "Neurons2",
+              "Inhibitory neurons",
+              "Oligodendrocyte precursor cells",
+              "Deep-layer excitatory neurons",
+              "Oligodendrocytes",
+              "VIP interneurons",
+              "Upper-layer excitatory neurons",
+              "Endothelial cells",
+              "Microglia")
+
+names(gpt_markers) <- 0:12
+ki@meta.data$GPTcelltypes <- as.factor(gpt_markers[as.character(Idents(ki))])
+DimPlot(ki, group.by = 'GPTcelltypes', label = TRUE,repel = T) + NoLegend()
+```
+
+## Add Metadata and check Batch Effect Visualization
+
+```{r metadata}
+# Import additional metadata and add to Seurat object
+ki_meta <- read.csv("data/metadata.tsv", sep = "\t", check.names = FALSE, stringsAsFactors = FALSE, row.names = 1)
+ki_meta_ordered <- ki_meta[match(Cells(ki), row.names(ki_meta)), ]
+for (i in colnames(ki_meta_ordered)) {
+  ki[[i]] <- ki_meta_ordered[, i]
+}
+
+# Visualize clusters by metadata columns
+DimPlot(ki, group.by = 'diagnosis')
+DimPlot(ki, group.by = 'sex')
+DimPlot(ki, group.by = 'Seqbatch')
+DimPlot(ki,group.by='Capbatch')
+FeaturePlot(ki,features = 'RNA.Integrity.Number')
+FeaturePlot(ki,features = 'post.mortem.interval..hours.')
+DimPlot(ki, ,group.by='sample') + NoLegend()
+```
+
+Although I do not see any batch effect in the plots or any skewed distribution for any of the metadata labels
+
+It would be good to search for tools where there are such confounding factors
+
+Few tools worth mentioning that can be implemented for batch effect correction
+
+-   Seurat data [integration](https://satijalab.org/seurat/articles/integration_introduction) workflow
+
+-   [scTrasform](https://satijalab.org/seurat/articles/sctransform_vignette)in Seurat instead of scaling / log normalize
+
+-   [Harmony](https://htmlpreview.github.io/?https://github.com/immunogenomics/harmony/blob/master/doc/quickstart.html)/ [scVI](https://docs.scvi-tools.org/en/latest/user_guide/models/scvi.html)
+
+-   [Monocle3](https://cole-trapnell-lab.github.io/monocle3/)
+
+## Public datasets
+
+There are many reference based annotation tools. Example: [scPRED](https://powellgenomicslab.github.io/scPred/articles/introduction.html) \
+Checking public datasets available in scRNASeq package for any suitable reference data.
+
+```{r public scRNAseq datasets in scRNAseq}
+all_ds=scRNAseq::listDatasets()
+
+# Filteres for human brain related datasets
+kable(all_ds[all_ds$Part %in% c("brain","cortex", "cortical organoids","visual cortex","prefrontal cortex") & all_ds$Taxonomy==9606,], format="markdown",align='c')
+
+#organoid data had a lot of cells so could be useful
+organoid=scRNAseq::BhaduriOrganoidData()
+
+unique(organoid$tissue)
+```
+
+## Further work
+
+The scope of project can be expanded to using other tools and various other dimensions to analyze the data:
+
+-   Other popular annotations tools ([sctype](https://sctype.app/), [celltypist](https://www.celltypist.org/), [Cell x Gene](https://cellxgene.cziscience.com/))
+
+-   Trajectory analysis and RNA velocity ([Monocle](https://cole-trapnell-lab.github.io/monocle3/docs/trajectories/)/ [scVelo](https://scvelo.readthedocs.io/en/stable/index.html))
+
+-   [Cellbender](https://cellbender.readthedocs.io/en/latest/)/ [scDblFinder](https://bioconductor.org/packages/release/bioc/vignettes/scDblFinder/inst/doc/introduction.html)/ [EmptyDrops](https://bioconductor.org/packages/devel/bioc/vignettes/DropletUtils/inst/doc/DropletUtils.html) for removing background/ doublets
+
+Infrastructure and code related next steps:
+
+-   If possible, make a nextflow workflow of all tools to ensure reproducibility
+
+    -   Inspired from [nf-core scdownstream](https://nf-co.re/scdownstream/dev/)
+
+-   Docker container for each tool to avoid installation issues
+
+-   Github repository of executable scripts (could be a common repo with Nextflow code)
+
+-   A R shiny dashborad to apply the same tools interactively on different datasets
+
+## Summary
+
+This was a beautiful dataset as we did not encounter any data related challenges. The QC was good and probably the data was already cleaned or filtered as there were no Mitochondrial genes.
+
+The provided metadata variables like Seqbatch, Capbatch, samples did not seem to have any confounding effects on the cell identity. Seurat based analysis went smoothly with default parmeters (Louvain clustering, effects of Leiden on clustering needs to be explored) and we explored a plethora of automated clustering tools including Chat GPT.
+
+I believe the Annotations from Azimuth tool that uses a Allen Institute refeerence data are most accurate and reliable, but it was shocking to see the comparable reproducibility from Chat GPT. Annotations from older tools (scCATCH and SingleR) felt subpar but may be they can be improved by using custom in-house well annotated reference database (if available).
+
+There is a lot more that can be achieved with this dataset as suggested in Further work section with respect to qualitative analysis following the best practices for scRNASeq processing (batch correction , doublet removal, RNA velocity, trajectory analysis), as well as from data and code infrastructure point of view (nextflow, containerization or a dashboard). Exploring these tools will help not only analyze this particular data but build pipelines for reproducible research.
+
+## References
+
+### Primary References
+
+1.  [Seurat](https://satijalab.org/seurat/)
+2.  [Azimuth](https://azimuth.hubmapconsortium.org/)
+3.  [Azimuth Human Motor Cortex reference](https://azimuth.hubmapconsortium.org/references/#Human%20-%20Motor%20Cortex)
+4.  [Seurat Extensions](https://satijalab.org/seurat/articles/extensions)
+5.  [scCatch](https://cran.r-project.org/web/packages/scCATCH/vignettes/tutorial.html)
+6.  [singleR](https://bioconductor.org/packages/release/bioc/vignettes/SingleR/inst/doc/SingleR.html)
+7.  [scRNAseq](https://bioconductor.org/packages/release/data/experiment/vignettes/scRNAseq/inst/doc/scRNAseq.html)
+8.  [GPTCellType](https://winnie09.github.io/Wenpin_Hou/pages/gptcelltype.html)
+9.  [OpenAI](https://openai.com/)
+
+### Git Repos
+
+1.  <https://github.com/theislab/scvelo> (yet to implement)
+2.  <https://github.com/zhanghao-njmu/SCP> (could be useful)
+3.  <https://github.com/broadinstitute/CellBender> (yet to implement)
+4.  <https://github.com/satijalab/seurat-data>
+5.  <https://github.com/satijalab/seurat>
+6.  <https://github.com/Winnie09/GPTCelltype>
+7.  <https://github.com/IanevskiAleksandr/sc-type>
+8.  <https://github.com/SingleR-inc/SingleR/tree/master>
+9.  <https://github.com/powellgenomicslab/scPred> (yet to implement)
+10. <https://github.com/immunogenomics/harmony> (yet to implement)
+11. <https://github.com/ZJUFanLab/scCATCH>
+12. <https://github.com/Chenlei-Hu/Slide_recon>
+
+### Citations
+
+These are a few papers that were touched breifly / skimmed and helped in gaining deeper understanding of a tool or data. There is no particular order. This list is not exhaustive.
+
+1.  Bhaduri, A., Andrews, M.G., Mancia Leon, W. *et al.* Cell stress in cortical organoids impairs molecular subtype specification. *Nature* **578**, 142–148 (2020). https://doi.org/10.1038/s41586-020-1962-0
+2.  Fleming, S.J., Chaffin, M.D., Arduini, A. *et al.* Unsupervised removal of systematic background noise from droplet-based single-cell experiments using CellBender. *Nat Methods* **20**, 1323–1335 (2023). https://doi.org/10.1038/s41592-023-01943-7
+3.  Bakken, T.E., Jorstad, N.L., Hu, Q. *et al.* Comparative cellular analysis of motor cortex in human, marmoset and mouse. *Nature* **598**, 111–119 (2021). https://doi.org/10.1038/s41586-021-03465-8
+4.  Lause, J., Berens, P. & Kobak, D. Analytic Pearson residuals for normalization of single-cell RNA-seq UMI data. *Genome Biol* **22**, 258 (2021). https://doi.org/10.1186/s13059-021-02451-7
+5.  Pasquini, G., Arias, J., Schäfer, P. & Busskamp, V. Automated methods for cell type annotation on scRNA-seq data. *Computational and Structural Biotechnology Journal* **19**, 961 (2021). https://doi.org/10.1016/j.csbj.2021.01.015
+6.  Hou, W., Ji, Z. Assessing GPT-4 for cell type annotation in single-cell RNA-seq analysis. *Nat Methods* **21**, 1462–1465 (2024). https://doi.org/10.1038/s41592-024-02235-4
+7.  Germain P, Lun A, Garcia Meixide C, Macnair W, Robinson M (2022). “Doublet identification in single-cell sequencing data using scDblFinder.” *f1000research*. doi:10.12688/f1000research.73600.2
+8.  Aran D, Looney AP, Liu L, Wu E, Fong V, Hsu A, Chak S, Naikawadi RP, Wolters PJ, Abate AR, Butte AJ, Bhattacharya M (2019). “Reference-based analysis of lung single-cell sequencing reveals a transitional profibrotic macrophage.” *Nat. Immunol.*, **20**, 163-172. doi:10.1038/s41590-018-0276-y
+9.  Hou, W., Ji, Z. Assessing GPT-4 for cell type annotation in single-cell RNA-seq analysis. *Nat Methods* **21**, 1462–1465 (2024). https://doi.org/10.1038/s41592-024-02235-4
+
+### Useful web articles
+
+1.  [An article on batch correction](https://www.nygen.io/resources/blog/batch-effect-normalization-techniques-scrna-seq)
+2.  [Cell x Gene Automated annotaton](https://cellxgene.cziscience.com/docs/05__Annotate%20and%20Analyze%20Your%20Data/5_5__Automatic%20Annotation)
+3.  [convert seurat obj to anndata](https://mojaveazure.github.io/seurat-disk/articles/convert-anndata.html)
+4.  [A reddit thread](https://www.reddit.com/r/bioinformatics/comments/1ccufty/how_do_you_guys_annotate_your_scrna_cell_clusters/)
+
+## Session Info
+
+```{r session-info}
+# Print session info for reproducibility
+sessionInfo()
+```
